@@ -16,14 +16,19 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import ExponentialLR
 sns.set(style='whitegrid')
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
 class ValueNetwork(nn.Module):
-    def __init__(self, hidden_size=12):
+    def __init__(self, hidden_size=24):
         super(ValueNetwork, self).__init__()
         self.dense1 = nn.Linear(1, hidden_size)
         self.dense2 = nn.Linear(hidden_size, hidden_size)
-        self.dense3 = nn.Linear(hidden_size, 1)
+        self.dense3 = nn.Linear(hidden_size, hidden_size)
+        self.output = nn.Linear(hidden_size, 1)
         self.relu = nn.ReLU()
         self.Tanh = nn.Tanh()
 
@@ -33,32 +38,37 @@ class ValueNetwork(nn.Module):
         x = self.dense2(x)
         x = self.Tanh(x)
         x = self.dense3(x)
+        x = self.Tanh(x)
+        x = self.output(x)
         return x
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, hidden_size=12):
+    def __init__(self, hidden_size=24):
         super(PolicyNetwork, self).__init__()
         self.dense1 = nn.Linear(1, hidden_size)
         self.dense2 = nn.Linear(hidden_size, hidden_size)
-        self.dense3 = nn.Linear(hidden_size, 1)
+        self.dense3 = nn.Linear(hidden_size, hidden_size)
+        self.output = nn.Linear(hidden_size, 1)
         self.relu = nn.ReLU()
         self.Tanh = nn.Tanh()
 
     def forward(self, x):
         x = self.dense1(x)
-        x = self.relu(x)
+        x = self.Tanh(x)
         x = self.dense2(x)
-        x = self.relu(x)
+        x = self.Tanh(x)
         x = self.dense3(x)
+        x = self.Tanh(x)
+        x = self.output(x)
         return x
 
 def pretrain(network, optimizer, data_loader, grid_k, epochs=100):
-    criterion = nn.MSELoss()  #平均二乗誤差を損失関数として使用
+    criterion = nn.MSELoss()  # 平均二乗誤差を損失関数として使用
 
     for epoch in range(epochs):
         total_loss = 0
         for data in data_loader:
-            inputs = data  # dataloaderからのデータが入力
+            inputs = data.to(device)  # dataloaderからのデータがGPUに転送
             targets = inputs  # プレトレーニングではgrid_k自体をターゲットとする
 
             optimizer.zero_grad()  # 勾配を初期化
@@ -73,8 +83,8 @@ def pretrain(network, optimizer, data_loader, grid_k, epochs=100):
     print("Final output plot after pretraining:")
 
     # grid_kを入力に使って出力をプロット
-    inputs = torch.tensor(grid_k, dtype=torch.float64).unsqueeze(1) # grid_kをテンソルに変換
-    outputs = network(inputs).detach().numpy()  # ネットワークの出力を計算
+    inputs = torch.tensor(grid_k, dtype=torch.float64).unsqueeze(1).to(device)  # grid_kをテンソルに変換しGPUに転送
+    outputs = network(inputs).detach().cpu().numpy()  # ネットワークの出力を計算
 
     # プロット
     plt.plot(grid_k, outputs, label='Pretrained Output')
@@ -97,7 +107,7 @@ class CapitalDataset(Dataset):
         return self.data[idx]
 
 def utility(c, sigma):
-    eps = torch.tensor(1e-8, dtype=torch.float64)
+    eps = torch.tensor(1e-8, dtype=torch.float64).to(device)
 
     if sigma == 1:
         return torch.log(torch.max(c, eps))
@@ -110,30 +120,31 @@ def vfi_det(params, value, policy, optimizer_value, optimizer_policy, dataloader
         diff = 0  # To track the maximum update difference
         count = 0
         for k in dataloader:
+            k = k.to(device)  # GPUにデータ転送
             count += 1
             max_c = k.squeeze()**alpha + (1-delta)*k.squeeze()
 
-            c = torch.clamp(policy(k).squeeze(1), min=torch.tensor(0, dtype=torch.float64), max=max_c)
+            c = torch.clamp(policy(k).squeeze(1), min=torch.tensor(0, dtype=torch.float64).to(device), max=max_c)
             u = utility(c, sigma)
             u[c < 0] = -10e10
             k_next = max_c - c
 
             k_next = k_next.unsqueeze(1)
 
-            # Right-hand side (Bellman equation) - use detach() to freeze the value(k) for this computation
+            # Bellman equation
             pre_value = value(k).detach()
-            value_k_detached = value(k_next).detach()  # detach to stop the gradient for the right-hand side
+            value_k_detached = value(k_next).detach()
 
             bellman = u + beta * value_k_detached.squeeze(1)
 
             # Left-hand side - value(k) should learn to match the right-hand side
             loss = (value(k).squeeze(1) - bellman).pow(2).mean()
             optimizer_value.zero_grad()
-            loss.backward(retain_graph = True)
+            loss.backward(retain_graph=True)
             optimizer_value.step()
 
             # Policy update
-            bellman_policy = u + beta * value(k_next) # Use the detached value for policy update as well
+            bellman_policy = u + beta * value(k_next)
             loss_policy = -torch.mean(bellman_policy)
             optimizer_policy.zero_grad()
             loss_policy.backward()
@@ -142,7 +153,7 @@ def vfi_det(params, value, policy, optimizer_value, optimizer_policy, dataloader
             # Calculate the update difference for stopping criterion
             diff = max(diff, torch.abs(value(k) - pre_value).mean().item())
 
-            if count == 10:
+            if count == 3:
               print(f"Epoch {t} with diff {diff}")
 
         # Break if the maximum difference is below the tolerance
@@ -150,26 +161,34 @@ def vfi_det(params, value, policy, optimizer_value, optimizer_policy, dataloader
             print(f"Converged at epoch {t+1} with diff {diff}")
             break
 
-    grid_k = torch.tensor(grid_k, dtype=torch.float64).view(-1,1)
-    consumption = policy(grid_k).squeeze(1).detach().numpy()
+    grid_k = torch.tensor(grid_k, dtype=torch.float64).view(-1,1).to(device)
+    consumption = policy(grid_k).squeeze(1).detach().cpu().numpy()
     return consumption, t
 
 class Neoclassical_NN:
     def __init__(self, plott=1, transition=1):
-        #parameters subject to changes
-        self.plott = plott #select 1 to make plots
+        self.plott = plott  # select 1 to make plots
         self.transition = transition  # select 1 to do transition
-        self.value = ValueNetwork()
-        self.policy = PolicyNetwork()
+        self.value = ValueNetwork().to(device)  # モデルをGPUに転送
+        self.policy = PolicyNetwork().to(device)  # モデルをGPUに転送
         self.optimizer_value = optim.Adam(self.value.parameters(), lr=0.001)
         self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=0.001)
 
+        # 学習率を0.01に設定
+        self.optimizer_value = optim.Adam(self.value.parameters(), lr=0.01)
+        self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=0.01)
+        
+        # 学習率減衰の設定 (0.01 -> 0.00001)
+        gamma = (0.00001 / 0.01) ** (1 / 1000)  # 1000エポックで0.01から0.00001に減衰
+        self.scheduler_value = ExponentialLR(self.optimizer_value, gamma=gamma)
+        self.scheduler_policy = ExponentialLR(self.optimizer_policy, gamma=gamma)
+        
         self.setup_parameters()
         self.setup_grid()
 
-        # Adding dataset and dataloader creation
-        self.batch_size = 20  # You can choose an appropriate batch size
-        self.dataset = CapitalDataset(self.grid_k)  # Create a dataset from the grid_k data
+        # Dataset and dataloader creation
+        self.batch_size = 128
+        self.dataset = CapitalDataset(self.grid_k)
         self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)
 
         self.params = self.sigma, self.beta, self.delta, self.alpha, self.grid_k, self.tol, self.epoch
@@ -181,51 +200,43 @@ class Neoclassical_NN:
             raise Exception("Transition option incorrectly entered: Choose either 1 or 0.")
 
     def setup_parameters(self):
-
-        # a. model parameters
-        self.sigma=2    #crra coefficient
+        self.sigma = 2  # CRRA coefficient
         self.beta = 0.95  # discount factor
-        self.rho = (1-self.beta)/self.beta #discount rate
         self.delta = 0.1  # depreciation rate
-        self.alpha = 1/3  # cobb-douglas coeffient
+        self.alpha = 1 / 3  # Cobb-Douglas coefficient
 
-        # b. steady state solution
-        self.k_ss = (self.alpha/(1/self.beta - (1-self.delta)))**(1/(1 - self.alpha)) #capital
-        self.c_ss = self.k_ss**(self.alpha) - self.delta*self.k_ss #consumption
-        self.i_ss = self.delta*self.k_ss    #investment
-        self.y_ss = self.k_ss**(self.alpha) #output
+        self.k_ss = (self.alpha / (1 / self.beta - (1 - self.delta))) ** (1 / (1 - self.alpha))
+        self.c_ss = self.k_ss ** self.alpha - self.delta * self.k_ss
+        self.i_ss = self.delta * self.k_ss
+        self.y_ss = self.k_ss ** self.alpha
 
-        # c. vfi solution
-        self.tol = 1e-5  # tolerance for vfi
-        self.maxit = 2000  # maximum number of iterations
-        self.epoch = 500
+        self.tol = 1e-8
+        self.maxit = 2000
+        self.epoch = 1000
 
-        # capital grid
-        self.Nk = 300
+        self.Nk = 128*5
         self.dev = 0.9
-        self.k_min = (1-self.dev)*self.k_ss
-        self.k_max = (1+self.dev)*self.k_ss
+        self.k_min = (1 - self.dev) * self.k_ss
+        self.k_max = (1 + self.dev) * self.k_ss
 
-        # d. transition
-        self.sim_T = 75    #number of transition periods
-        self.perc = 0.5     #percentage below the steady state where transition starts
-        self.cheb_order = 10    #chebyshev polynomial order
+        self.sim_T = 75
+        self.perc = 0.5
+        self.cheb_order = 10
 
     def setup_grid(self):
-        # a. capital grid
         self.grid_k = np.linspace(self.k_min, self.k_max, self.Nk)
 
     def perfect_foresight_transition(self):
-      trans_k = torch.zeros(self.sim_T+1).double()
-      trans_k[0] = self.perc * self.k_ss  # initial capital
-      trans_cons = torch.zeros(self.sim_T).double()
-      for t in range(self.sim_T):
-          trans_cons[t] = self.policy(trans_k[t].view(-1,1)).squeeze(1)
-          trans_k[t+1] = trans_k[t] ** self.alpha + (1 - self.delta) * trans_k[t] - trans_cons[t]
-      trans_output = trans_k[0:-1] ** self.alpha
-      trans_inv = trans_k[1:] - (1 - self.delta) * trans_k[0:-1]
+        trans_k = torch.zeros(self.sim_T + 1).double().to(device)
+        trans_k[0] = self.perc * self.k_ss
+        trans_cons = torch.zeros(self.sim_T).double().to(device)
+        for t in range(self.sim_T):
+            trans_cons[t] = self.policy(trans_k[t].view(-1, 1)).squeeze(1)
+            trans_k[t + 1] = trans_k[t] ** self.alpha + (1 - self.delta) * trans_k[t] - trans_cons[t]
+        trans_output = trans_k[0:-1] ** self.alpha
+        trans_inv = trans_k[1:] - (1 - self.delta) * trans_k[0:-1]
 
-      return trans_k.detach().numpy(), trans_cons.detach().numpy(), trans_output.detach().numpy(), trans_inv.detach().numpy()
+        return trans_k.detach().cpu().numpy(), trans_cons.detach().cpu().numpy(), trans_output.detach().cpu().numpy(), trans_inv.detach().cpu().numpy()
 
     def pretrain_models(self, pretrain_epochs=100):
         print("Pretraining Value Network...")
@@ -235,41 +246,40 @@ class Neoclassical_NN:
         pretrain(self.policy, self.optimizer_policy, self.dataloader, self.grid_k, epochs=pretrain_epochs)
 
     def solve_model(self):
-        t0 = time.time()    #start the clock
+        t0 = time.time()
 
         # Pretrain models
-        self.pretrain_models(pretrain_epochs=10)  # 事前学習を100エポック行う
+        self.pretrain_models(pretrain_epochs=100)
 
-        # a. solve social planer's problem
         print("\nSolving social planner problem...")
         self.pol_cons, self.t = vfi_det(self.params, self.value, self.policy, self.optimizer_value, self.optimizer_policy, self.dataloader)
 
-        if self.t < self.maxit-1:
+        if self.t < self.maxit - 1:
             print(f"Converged in {self.t} iterations.")
         else:
             print("Did not converge.")
 
         t1 = time.time()
-        print(f"Time: {t1-t0:.2f} seconds")
+        print(f"Time: {t1 - t0:.2f} seconds")
 
         if self.transition:
             print("\nSteady State Transition...")
             self.trans_k, self.trans_cons, self.trans_output, self.trans_inv = self.perfect_foresight_transition()
 
             t2 = time.time()
-            print(f'Transition iteration time elapsed: {t2-t1:.2f} seconds')
+            print(f'Transition iteration time elapsed: {t2 - t1:.2f} seconds')
 
         if self.plott:
             print('\nPlotting...')
-            plt.plot(self.grid_k, self.value(torch.tensor(self.grid_k, dtype=torch.float64).view(-1,1)).detach().numpy())
+            plt.plot(self.grid_k, self.value(torch.tensor(self.grid_k, dtype=torch.float64).view(-1, 1).to(device)).detach().cpu().numpy())
             plt.title('Value Function')
             plt.xlabel('Capital Stock')
             plt.show()
 
-            plt.plot(self.grid_k, self.policy(torch.tensor(self.grid_k, dtype=torch.float64).view(-1,1)).detach().numpy())
+            plt.plot(self.grid_k, self.policy(torch.tensor(self.grid_k, dtype=torch.float64).view(-1, 1).to(device)).detach().cpu().numpy())
             plt.title('Next Period Capital Stock Policy Function')
             plt.xlabel('Capital Stock')
-            plt.plot([self.k_min,self.k_max], [self.k_min,self.k_max],linestyle=':')
+            plt.plot([self.k_min, self.k_max], [self.k_min, self.k_max], linestyle=':')
             plt.legend(['Policy Function', '45 Degree Line'])
             plt.show()
 
@@ -280,35 +290,34 @@ class Neoclassical_NN:
 
             if self.transition:
                 plt.plot(np.arange(self.sim_T), self.trans_k[:-1])
-                plt.plot(np.arange(self.sim_T), self.k_ss*np.ones(self.sim_T), linestyle='--')
+                plt.plot(np.arange(self.sim_T), self.k_ss * np.ones(self.sim_T), linestyle='--')
                 plt.title('Transition Dynamics: Capital Stock')
                 plt.xlabel('Time')
                 plt.show()
 
                 plt.plot(np.arange(self.sim_T), self.trans_cons)
-                plt.plot(np.arange(self.sim_T), self.c_ss*np.ones(self.sim_T), linestyle='--')
+                plt.plot(np.arange(self.sim_T), self.c_ss * np.ones(self.sim_T), linestyle='--')
                 plt.title('Transition Dynamics: Consumption')
                 plt.xlabel('Time')
                 plt.show()
 
                 plt.plot(np.arange(self.sim_T), self.trans_output)
-                plt.plot(np.arange(self.sim_T), self.y_ss*np.ones(self.sim_T), linestyle='--')
+                plt.plot(np.arange(self.sim_T), self.y_ss * np.ones(self.sim_T), linestyle='--')
                 plt.title('Transition Dynamics: Output')
                 plt.xlabel('Time')
                 plt.show()
 
                 plt.plot(np.arange(self.sim_T), self.trans_inv)
-                plt.plot(np.arange(self.sim_T), self.i_ss*np.ones(self.sim_T), linestyle='--')
+                plt.plot(np.arange(self.sim_T), self.i_ss * np.ones(self.sim_T), linestyle='--')
                 plt.title('Transition Dynamics: Investment')
                 plt.xlabel('Time')
                 plt.show()
 
             t3 = time.time()
-            print(f'Plot time elapsed: {t3-t2:.2f} seconds')
+            print(f'Plot time elapsed: {t3 - t2:.2f} seconds')
 
         t4 = time.time()
-        print(f'\nTotal Run Time: {t4-t0:.2f} seconds')
-
+        print(f'\nTotal Run Time: {t4 - t0:.2f} seconds')
 
 
 ncgm = Neoclassical_NN()
