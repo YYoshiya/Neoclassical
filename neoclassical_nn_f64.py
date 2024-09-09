@@ -115,8 +115,9 @@ def utility(c, sigma):
     else:
         return (torch.max(c, eps)**(1-sigma) - 1) / (1 - sigma)
 
-def vfi_det(params, value, policy, optimizer_value, optimizer_policy, dataloader):
-    sigma, beta, delta, alpha, grid_k, tol, epoch = params
+
+def vfi_det(params, value, policy, optimizer_value, optimizer_policy, dataloader, dataloader_policy):
+    sigma, beta, delta, alpha, grid_k, tol, epoch, policy_epoch = params
     for t in range(epoch):
         diff = 0  # To track the maximum update difference
         count = 0
@@ -142,16 +143,25 @@ def vfi_det(params, value, policy, optimizer_value, optimizer_policy, dataloader
             # Left-hand side - value(k) should learn to match the right-hand side
             loss = (value(k).squeeze(1) - bellman).pow(2).mean()
             optimizer_value.zero_grad()
-            loss.backward(retain_graph=True)
+            loss.backward()
             optimizer_value.step()
 
-            # Policy update
-            bellman_policy = u + beta * value(k_next)
-            loss_policy = -torch.mean(bellman_policy)
-            optimizer_policy.zero_grad()
-            loss_policy.backward()
-            optimizer_policy.step()
-
+            if t % 20 == 0:
+                for t_policy in range(policy_epoch):
+                    for k in dataloader_policy:
+                        k = k.to(device)
+                        max_c = k.squeeze()**alpha + (1-delta)*k.squeeze()
+                        c = torch.clamp(policy(k).squeeze(1), min=torch.tensor(0, dtype=torch.float64).to(device), max=max_c)
+                        u = utility(c, sigma)
+                        u[c < 0] = -10e10
+                        k_next = max_c - c
+                        k_next = k_next.unsqueeze(1)
+                        bellman_policy = u + beta * value(k_next).squeeze(1)
+                        loss_policy = -torch.mean(bellman_policy)
+                        optimizer_policy.zero_grad()
+                        loss_policy.backward()
+                        optimizer_policy.step()
+                        
             # Calculate the update difference for stopping criterion
             diff = max(diff, torch.abs(value(k) - pre_value).mean().item())
             with torch.no_grad():
@@ -174,7 +184,7 @@ class Neoclassical_NN:
         self.value = ValueNetwork().to(device)  # モデルをGPUに転送
         self.policy = PolicyNetwork().to(device)  # モデルをGPUに転送
         self.optimizer_value = optim.Adam(self.value.parameters(), lr=0.001)
-        self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=0.001)
+        self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=0.005)
         
         # 学習率減衰の設定 (0.01 -> 0.00001)
         gamma = (0.00001 / 0.01) ** (1 / 1000)  # 1000エポックで0.01から0.00001に減衰
@@ -188,8 +198,9 @@ class Neoclassical_NN:
         self.batch_size = 128
         self.dataset = CapitalDataset(self.grid_k)
         self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)
+        self.dataloader_policy = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)
 
-        self.params = self.sigma, self.beta, self.delta, self.alpha, self.grid_k, self.tol, self.epoch
+        self.params = self.sigma, self.beta, self.delta, self.alpha, self.grid_k, self.tol, self.epoch, self.policy_epoch
 
         if self.plott != 1 and self.plott != 0:
             raise Exception("Plot option incorrectly entered: Choose either 1 or 0.")
@@ -211,6 +222,7 @@ class Neoclassical_NN:
         self.tol = 1e-8
         self.maxit = 2000
         self.epoch = 1000
+        self.policy_epoch = 100
 
         self.Nk = 128*5
         self.dev = 0.9
@@ -250,7 +262,7 @@ class Neoclassical_NN:
         self.pretrain_models(pretrain_epochs=20)
 
         print("\nSolving social planner problem...")
-        self.pol_cons, self.t = vfi_det(self.params, self.value, self.policy, self.optimizer_value, self.optimizer_policy, self.dataloader)
+        self.pol_cons, self.t = vfi_det(self.params, self.value, self.policy, self.optimizer_value, self.optimizer_policy, self.dataloader, self.dataloader_policy)
 
         if self.t < self.maxit - 1:
             print(f"Converged in {self.t} iterations.")
