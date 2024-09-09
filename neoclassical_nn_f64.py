@@ -62,7 +62,8 @@ class PolicyNetwork(nn.Module):
         x = self.output(x)
         return x
 
-def pretrain(network, optimizer, data_loader, grid_k, epochs=100):
+def pretrain(network, optimizer, data_loader, grid_k, epochs=100, lr=0.01):
+    optimizer = optim.Adam(network.parameters(), lr=lr)
     criterion = nn.MSELoss()  # 平均二乗誤差を損失関数として使用
 
     for epoch in range(epochs):
@@ -133,9 +134,10 @@ def vfi_det(params, value, policy, optimizer_value, optimizer_policy, dataloader
 
             # Bellman equation
             pre_value = value(k).detach()
-            value_k_detached = value(k_next).detach()
+            value_k_detached = value(k_next)
 
             bellman = u + beta * value_k_detached.squeeze(1)
+            bellman = bellman.detach()
 
             # Left-hand side - value(k) should learn to match the right-hand side
             loss = (value(k).squeeze(1) - bellman).pow(2).mean()
@@ -152,9 +154,9 @@ def vfi_det(params, value, policy, optimizer_value, optimizer_policy, dataloader
 
             # Calculate the update difference for stopping criterion
             diff = max(diff, torch.abs(value(k) - pre_value).mean().item())
-
-            if count == 3:
-              print(f"Epoch {t} with diff {diff}")
+            with torch.no_grad():
+                if count == 3:
+                    print(f"Epoch {t+1}, Loss: {loss.item()}")
 
         # Break if the maximum difference is below the tolerance
         if diff < tol:
@@ -173,10 +175,6 @@ class Neoclassical_NN:
         self.policy = PolicyNetwork().to(device)  # モデルをGPUに転送
         self.optimizer_value = optim.Adam(self.value.parameters(), lr=0.001)
         self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=0.001)
-
-        # 学習率を0.01に設定
-        self.optimizer_value = optim.Adam(self.value.parameters(), lr=0.01)
-        self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=0.01)
         
         # 学習率減衰の設定 (0.01 -> 0.00001)
         gamma = (0.00001 / 0.01) ** (1 / 1000)  # 1000エポックで0.01から0.00001に減衰
@@ -249,7 +247,7 @@ class Neoclassical_NN:
         t0 = time.time()
 
         # Pretrain models
-        self.pretrain_models(pretrain_epochs=100)
+        self.pretrain_models(pretrain_epochs=20)
 
         print("\nSolving social planner problem...")
         self.pol_cons, self.t = vfi_det(self.params, self.value, self.policy, self.optimizer_value, self.optimizer_policy, self.dataloader)
@@ -311,6 +309,7 @@ class Neoclassical_NN:
                 plt.plot(np.arange(self.sim_T), self.i_ss * np.ones(self.sim_T), linestyle='--')
                 plt.title('Transition Dynamics: Investment')
                 plt.xlabel('Time')
+                plt.ylim([0.3, 0.4])
                 plt.show()
 
             t3 = time.time()
