@@ -148,7 +148,7 @@ def vfi_det(ncgm, value, policy, optimizer_value, optimizer_policy, dataloader):
             optimizer_value.step()
 
             # Policy update
-            bellman_policy = u + beta * ncgm.unnormalize(value(k_next))
+            bellman_policy = u + beta * ncgm.unnormalize(value(k_next_norm).squeeze(1))
             loss_policy = -torch.mean(bellman_policy)
             optimizer_policy.zero_grad()
             loss_policy.backward()
@@ -168,7 +168,7 @@ def vfi_det(ncgm, value, policy, optimizer_value, optimizer_policy, dataloader):
     return consumption, t
 
 class Neoclassical_NN:
-    def __init__(self, plott=0, transition=0):
+    def __init__(self, plott=1, transition=1):
         self.plott = plott  # select 1 to make plots
         self.transition = transition  # select 1 to do transition
         self.value = ValueNetwork().to(device)  # モデルをGPUに転送
@@ -239,20 +239,26 @@ class Neoclassical_NN:
             self.sigma_cpu = torch.std(x)
             return (x - self.mu_cpu) / self.sigma_cpu
     
-    def normalize(self, x):
-        return (x - self.mu) / self.sigma
+    def normalize(self, x, gpu=True):
+        if gpu:
+            return (x - self.mu) / self.sigma
+        else:
+            return (x - self.mu_cpu) / self.sigma_cpu
     
     def unnormalize(self, x):
         return x * self.sigma + self.mu
 
     def perfect_foresight_transition(self):
+        self.k_ss_norm = self.normalize(self.k_ss, gpu=False)
+        self.c_ss_norm = self.normalize(self.c_ss, gpu=False) * (self.k_ss_norm ** self.alpha + (1 - self.delta) * self.k_ss_norm)
         trans_k = torch.zeros(self.sim_T + 1).double().to(device)
-        trans_k[0] = self.perc * self.k_ss
-        trans_k = self.normalize(trans_k[0])
+        trans_k0 = self.perc * self.k_ss
+        trans_k[0] = self.normalize(trans_k0)
         trans_cons = torch.zeros(self.sim_T).double().to(device)
         for t in range(self.sim_T):
-            trans_cons[t] = self.policy(trans_k[t].unsqueeze()).squeeze(1) * (trans_k[t] ** self.alpha + (1 - self.delta) * self.trans_k[t])
+            trans_cons[t] = self.policy(trans_k[t].view(-1,1)).squeeze(1) * (trans_k[t] ** self.alpha + (1 - self.delta) * trans_k[t])
             trans_k[t + 1] = trans_k[t] ** self.alpha + (1 - self.delta) * trans_k[t] - trans_cons[t]
+        trans_k = self.unnormalize(trans_k)
         trans_output = trans_k[0:-1] ** self.alpha
         trans_inv = trans_k[1:] - (1 - self.delta) * trans_k[0:-1]
 
@@ -296,7 +302,8 @@ class Neoclassical_NN:
             plt.xlabel('Capital Stock')
             plt.show()
 
-            plt.plot(self.grid_k, self.policy(torch.tensor(self.grid_k, dtype=torch.float64).view(-1, 1).to(device)).detach().cpu().numpy())
+            consumption = self.policy(self.grid_k_norm.view(-1, 1)).squeeze().detach().cpu().numpy() * (self.grid_k_norm** self.alpha + (1 - self.delta) * self.grid_k_norm)
+            plt.plot(self.grid_k, unnormalize(consumption))
             plt.title('Next Period Capital Stock Policy Function')
             plt.xlabel('Capital Stock')
             plt.plot([self.k_min, self.k_max], [self.k_min, self.k_max], linestyle=':')
@@ -310,13 +317,13 @@ class Neoclassical_NN:
 
             if self.transition:
                 plt.plot(np.arange(self.sim_T), self.trans_k[:-1])
-                plt.plot(np.arange(self.sim_T), self.k_ss * np.ones(self.sim_T), linestyle='--')
+                plt.plot(np.arange(self.sim_T), self.k_ss_norm * np.ones(self.sim_T), linestyle='--')
                 plt.title('Transition Dynamics: Capital Stock')
                 plt.xlabel('Time')
                 plt.show()
 
                 plt.plot(np.arange(self.sim_T), self.trans_cons)
-                plt.plot(np.arange(self.sim_T), self.c_ss * np.ones(self.sim_T), linestyle='--')
+                plt.plot(np.arange(self.sim_T), self.c_ss_norm * np.ones(self.sim_T), linestyle='--')
                 plt.title('Transition Dynamics: Consumption')
                 plt.xlabel('Time')
                 plt.show()
