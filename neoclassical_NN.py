@@ -107,59 +107,6 @@ def utility(c, sigma):
     else:
         return (torch.max(c, eps)**(1-sigma) - 1) / (1 - sigma)
 
-def vfi_det(params, value, policy, optimizer_value, optimizer_policy, dataloader):
-    sigma, beta, delta, alpha, grid_k, tol, epoch = params
-    for t in range(epoch):
-        total_loss_value = 0  # ロスの合計
-          # サンプル数をカウント
-        count = 0
-
-        for k in dataloader:
-            k = k.to(device)  # GPUにデータ転送
-            count += 1
-            max_c = k.squeeze()**alpha + (1-delta)*k.squeeze()
-
-            c_value = policy(k).detach()
-            c = torch.clamp(c_value.squeeze(1), min=torch.tensor(0).to(device), max=max_c)
-            u_value = utility(c, sigma)
-            k_next = max_c - c
-
-            k_next = k_next.unsqueeze(1)
-
-            bellman = u_value + beta * value(k_next).squeeze(1)
-            bellman = bellman.detach()
-
-            # Left-hand side - value(k) should learn to match the right-hand side
-            loss = (value(k).squeeze(1) - bellman).pow(2).mean()
-            optimizer_value.zero_grad()
-            loss.backward()
-            optimizer_value.step()
-
-            # ロスを蓄積
-            total_loss_value += loss.item()
-            #if count % 10 == 0:
-              # Policy update
-            c_policy = torch.clamp(policy(k).squeeze(1), min=torch.tensor(0).to(device), max=max_c)
-            k_next_policy = (max_c - c_policy).unsqueeze(1)
-            u_policy = utility(c_policy, sigma)
-
-            bellman_policy = u_policy + beta * value(k_next_policy)#If there is detach.() here, can't update policy correctly.
-            loss_policy = -torch.mean(bellman_policy)
-            optimizer_policy.zero_grad()
-            loss_policy.backward()
-            optimizer_policy.step()
-            #print(f"count: {count}, policy loss: {-loss_policy}")
-
-        # 20エポックごとにvalueのロスをプリント
-        avg_loss_value = total_loss_value / count
-        if avg_loss_value < 0.000006:
-            break
-        if (t + 1) % 20 == 0:
-            print(f"Epoch {t + 1}, Value Loss: {avg_loss_value:.8f}")
-    grid_k = torch.tensor(grid_k, dtype=torch.float32).view(-1, 1).to(device)
-    consumption = policy(grid_k).squeeze(1).detach().cpu().numpy()
-    return consumption, t
-
 class Neoclassical_NN:
     def __init__(self, plott=1, transition=1):
         self.plott = plott  # select 1 to make plots
@@ -178,6 +125,8 @@ class Neoclassical_NN:
         self.batch_size = 128
         self.dataset = CapitalDataset(self.grid_k)
         self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)
+        self.dataloader_policy = DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)
+        self.valid_dataloader = DataLoader(self.dataset, batch_size=self.Nk, shuffle=False)
 
         self.params = self.sigma, self.beta, self.delta, self.alpha, self.grid_k, self.tol, self.epoch
 
@@ -200,7 +149,7 @@ class Neoclassical_NN:
 
         self.tol = 1e-8
         self.maxit = 2000
-        self.epoch = 5000
+        self.epoch = 1000
 
         self.Nk = 128*5
         self.dev = 0.9
@@ -209,6 +158,9 @@ class Neoclassical_NN:
 
         self.sim_T = 75
         self.perc = 0.5
+        
+        self.epoch_v = 20
+        self.epoch_p = 20
 
 
     def setup_grid(self):
@@ -233,6 +185,79 @@ class Neoclassical_NN:
         print("Pretraining Policy Network...")
         pretrain(self.policy, self.optimizer_policy, self.dataloader, self.grid_k, epochs=pretrain_epochs)
 
+
+    
+    def value_train(self, data):
+        loss = self.value_loss(data)
+        self.optimizer_value.zero_grad()
+        loss.backward()
+        self.optimizer_value.step()
+    
+    def value_loss(self, data):
+        max_c = data.squeeze()**self.alpha + (1-self.delta)*data.squeeze()
+        c = self.policy(data).squeeze(1)
+        c = torch.clamp(c, min=torch.tensor(0).to(device), max=max_c)
+        u = utility(c, self.sigma)
+        k_next = max_c - c
+        k_next = k_next.unsqueeze(1)
+        bellman = u + self.beta * self.value(k_next).squeeze(1)
+        loss = nn.MSELoss()(self.value(data).squeeze(1), bellman.detach())
+        return loss
+
+
+    def policy_train(self, data):
+        loss = self.policy_loss(data)
+        self.optimizer_policy.zero_grad()
+        loss.backward()
+        self.optimizer_policy.step()
+
+        
+    def policy_loss(self, data):
+        max_c = data.squeeze()**self.alpha + (1-self.delta)*data.squeeze()
+        c = self.policy(data).squeeze(1)
+        c = torch.clamp(c, min=torch.tensor(0).to(device), max=max_c)
+        u = utility(c, self.sigma)
+        k_next = max_c - c
+        k_next = k_next.unsqueeze(1)
+        bellman = u + self.beta * self.value(k_next).squeeze(1)
+        loss = -torch.mean(bellman)
+        return loss
+        
+    def vfi_det(self):
+        policy_count = 0
+        valid_loss = torch.zeros((2, self.epoch))
+        for t in range(self.epoch):
+              # ロスの合計
+            # サンプル数をカウント
+            
+            for v in range(self.epoch_v):
+                for k in self.dataloader:
+                    k = k.to(device)  # GPUにデータ転送
+                    self.value_train(k)
+            for p in range(self.epoch_p):
+                for k in self.dataloader_policy:
+                    k = k.to(device)
+                    self.policy_train(k)
+            # 20エポックごとにvalueのロスをプリント
+            
+            with torch.no_grad():
+                for k in self.valid_dataloader:
+                    k = k.to(device)
+                    value_loss = self.value_loss(k)
+                    policy_loss = self.policy_loss(k)
+                valid_loss[0, t] = value_loss
+                valid_loss[1, t] = -policy_loss
+                if t > 0:
+                    loss_diff_v = torch.abs(valid_loss[0, t] - valid_loss[0, t - 1])
+                    loss_diff_p = torch.abs(valid_loss[1, t] - valid_loss[1, t - 1])
+                    print(f"Epoch {t + 1}, loss_diff_v: {loss_diff_v:.8f}, value_loss: {value_loss},loss_diff_p: {loss_diff_p:.8f}")
+                    if (value_loss < 5e-5 and loss_diff_v < 1e-6 ) or t == 500: #
+                        break
+                #print(f"Epoch {t + 1}, loss_diff: {loss_diff:.8f}")
+        grid_k = torch.tensor(self.grid_k, dtype=torch.float32).view(-1, 1).to(device)
+        consumption = self.policy(grid_k).squeeze(1).detach().cpu().numpy()
+        return consumption, t
+
     def solve_model(self):
         t0 = time.time()
 
@@ -240,7 +265,7 @@ class Neoclassical_NN:
         self.pretrain_models(pretrain_epochs=20)
 
         print("\nSolving social planner problem...")
-        self.pol_cons, self.t = vfi_det(self.params, self.value, self.policy, self.optimizer_value, self.optimizer_policy, self.dataloader)
+        self.pol_cons, self.t = self.vfi_det()
 
         if self.t < self.maxit - 1:
             print(f"Converged in {self.t} iterations.")
