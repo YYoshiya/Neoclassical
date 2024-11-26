@@ -12,7 +12,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 class ValueNetwork(nn.Module):
-    def __init__(self, hidden_size=36):
+    def __init__(self, hidden_size=64):
         super(ValueNetwork, self).__init__()
         self.dense1 = nn.Linear(1, hidden_size)
         self.dense2 = nn.Linear(hidden_size, hidden_size)
@@ -33,7 +33,7 @@ class ValueNetwork(nn.Module):
         return x
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, hidden_size=36):
+    def __init__(self, hidden_size=64):
         super(PolicyNetwork, self).__init__()
         self.dense1 = nn.Linear(1, hidden_size)
         self.dense2 = nn.Linear(hidden_size, hidden_size)
@@ -251,7 +251,7 @@ class Neoclassical_NN:
                     loss_diff_v = torch.abs(valid_loss[0, t] - valid_loss[0, t - 1])
                     loss_diff_p = torch.abs(valid_loss[1, t] - valid_loss[1, t - 1])
                     print(f"Epoch {t + 1}, loss_diff_v: {loss_diff_v:.8f}, value_loss: {value_loss},loss_diff_p: {loss_diff_p:.8f}")
-                    if (value_loss < 5e-5 and loss_diff_v < 1e-6 ) or t == 500: #
+                    if (value_loss < 1e-5 and loss_diff_v < 1e-6 ) or t == 100:
                         break
                 #print(f"Epoch {t + 1}, loss_diff: {loss_diff:.8f}")
         grid_k = torch.tensor(self.grid_k, dtype=torch.float32).view(-1, 1).to(device)
